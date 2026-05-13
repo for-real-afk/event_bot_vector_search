@@ -8,7 +8,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.config import settings
 from app.models import AttendeeCreate, SearchResponse, BulkUpsertResponse
 from app.search_engine import SearchEngine
-from app.groq_client import expand_query
+from app.groq_client import parse_query
 
 logging.basicConfig(
     level=logging.DEBUG if settings.debug else logging.INFO,
@@ -23,7 +23,7 @@ engine: SearchEngine = None
 async def lifespan(app: FastAPI):
     global engine
     logger.info("Starting Event Search Service…")
-    engine = SearchEngine()   # loads embedding model + ensures Qdrant collection
+    engine = SearchEngine()
     logger.info("Ready — vector search active.")
     yield
     logger.info("Shutdown.")
@@ -38,38 +38,29 @@ app = FastAPI(
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],    # tighten per-domain in prod
+    allow_origins=["*"],
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 
-# ── Health ─────────────────────────────────────────────────────────────
+# ── Health ─────────────────────────────────────────────────────────────────────
 
 @app.get("/health", tags=["ops"])
 def health():
     return {"status": "ok", "version": settings.api_version}
 
 
-# ── Indexing (called by your main backend) ─────────────────────────────
+# ── Indexing ───────────────────────────────────────────────────────────────────
 
 @app.post("/attendees", status_code=201, tags=["indexing"])
 def add_attendee(attendee: AttendeeCreate):
-    """
-    Index a single attendee. Call this from your main backend
-    on new registration or profile update.
-    """
     engine.upsert(attendee)
     return {"indexed": 1, "id": attendee.id}
 
 
 @app.post("/attendees/bulk", response_model=BulkUpsertResponse, status_code=201, tags=["indexing"])
 def bulk_add(attendees: List[AttendeeCreate]):
-    """
-    Bulk import — use this to seed from your DB at event setup.
-    fastembed batches all embeddings in one forward pass, so this is
-    much faster than calling /attendees in a loop.
-    """
     count = engine.upsert_bulk(attendees)
     return BulkUpsertResponse(indexed=count, message=f"{count} attendee(s) indexed")
 
@@ -82,61 +73,57 @@ def remove_attendee(attendee_id: str):
 
 @app.delete("/attendees", tags=["indexing"])
 def wipe_index():
-    """Wipe and recreate the collection. Use when re-seeding for a new event."""
     engine.delete_all()
     return {"message": "Index wiped and recreated"}
 
 
-# ── Search (called by your frontend / event bot) ───────────────────────
+# ── Search ─────────────────────────────────────────────────────────────────────
 
 @app.get("/search", response_model=SearchResponse, tags=["search"])
 async def search(
     q: str = Query(..., min_length=1, description="Natural language search query"),
     limit: int = Query(10, ge=1, le=50),
-    # Hard filters — applied before vector scoring
-    experience_level: Optional[str] = Query(
-        None, description="junior | mid | senior | expert"
-    ),
-    organization: Optional[str] = Query(
-        None, description="Exact org name filter"
-    ),
+    # Manual overrides — these take priority over LLM-extracted filters
+    experience_level: Optional[str] = Query(None, description="Override: junior | mid | senior | expert"),
+    organization: Optional[str] = Query(None, description="Override: exact org name"),
 ):
     """
-    Semantic vector search over attendee profiles.
+    Semantic search with automatic query understanding.
 
-    How it works:
-    1. (Optional) Groq expands your query with synonyms
-    2. The query is embedded using BAAI/bge-small-en-v1.5
-    3. Qdrant finds the closest attendee vectors by cosine similarity
-    4. Results with score < 0.25 are filtered out automatically
+    The query is parsed by an LLM (Groq) which:
+    1. Extracts experience level  — "5 years experience" → mid filter
+    2. Extracts organization      — "people at IIT Bombay" → org filter
+    3. Expands the semantic query — "ML" → "machine learning deep learning NLP PyTorch"
+
+    Manual filter params override LLM-extracted ones if both are provided.
 
     Example queries:
-    - /search?q=machine learning healthcare
-    - /search?q=founders in agriculture&experience_level=senior
-    - /search?q=open source developer looking to collaborate
-    - /search?q=investor interested in deep tech
+    - ai engineers with less than 5 years experience
+    - senior NLP researchers
+    - founders working in agriculture
+    - junior data scientists at IIT Bombay
     """
-    # Step 1: Groq query expansion (gracefully skipped if key not set)
-    expanded = await expand_query(q)
-    search_query = expanded or q
+    # Step 1: Parse query with LLM
+    parsed = await parse_query(q)
+    semantic_query = parsed["semantic_query"]
+    extracted_filters = parsed["filters"]
 
-    # Step 2: Build hard pre-filters
-    filters = {}
+    # Step 2: Manual params override LLM-extracted filters
     if experience_level:
-        filters["experience_level"] = experience_level
+        extracted_filters["experience_level"] = experience_level
     if organization:
-        filters["organization"] = organization
+        extracted_filters["organization"] = organization
 
     # Step 3: Vector search
     results = engine.search(
-        query=search_query,
+        query=semantic_query,
         limit=limit,
-        filters=filters or None,
+        filters=extracted_filters or None,
     )
 
     return SearchResponse(
         query=q,
-        expanded_query=expanded,
+        expanded_query=semantic_query if semantic_query != q else None,
         total=len(results),
         results=results,
     )
