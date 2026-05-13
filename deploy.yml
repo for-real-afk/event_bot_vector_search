@@ -1,0 +1,35 @@
+name: Deploy to EC2
+
+on:
+  push:
+    branches: [main]       # triggers on every push to main
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Deploy via SSH
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host:     ${{ secrets.EC2_HOST }}
+          username: ${{ secrets.EC2_USERNAME }}
+          key:      ${{ secrets.EC2_SSH_KEY }}
+          script: |
+            set -e
+
+            cd ~/event-search-service
+
+            echo "── Pulling latest code ─────────────────────"
+            git pull origin main
+
+            echo "── Installing any new dependencies ─────────"
+            source venv/bin/activate
+            pip install -r requirements.txt -q
+
+            echo "── Restarting service ───────────────────────"
+            sudo systemctl restart event-search
+
+            echo "── Health check ─────────────────────────────"
+            sleep 3
+            curl -sf http://localhost:8001/health && echo " OK" || echo " FAILED"

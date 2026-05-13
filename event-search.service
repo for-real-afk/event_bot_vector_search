@@ -1,0 +1,17 @@
+[Unit]
+Description=Event Attendee Search Service
+After=network.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/event-search-service
+EnvironmentFile=/home/ubuntu/event-search-service/.env
+ExecStart=/home/ubuntu/event-search-service/venv/bin/uvicorn app.main:app --host 0.0.0.0 --port 8001
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
