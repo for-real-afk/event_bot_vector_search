@@ -1,0 +1,14 @@
+version: "3.9"
+
+# No local DB needed — Pinecone is managed/cloud.
+# This just containerises the search service itself.
+
+services:
+  search-service:
+    build: .
+    container_name: event-search-api
+    ports:
+      - "8001:8001"
+    env_file:
+      - .env
+    restart: unless-stopped
