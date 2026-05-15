@@ -5,10 +5,10 @@ from typing import Optional, List
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.config import settings
-from app.models import AttendeeCreate, AttendeeProfile, AttendeeResult, SearchResponse, BulkUpsertResponse
-from app.search_engine import SearchEngine
-from app.groq_client import parse_query
+from config import settings
+from models import AttendeeCreate, AttendeeProfile, AttendeeResult, SearchResponse, BulkUpsertResponse
+from search_engine import SearchEngine
+from groq_client import parse_query
 
 logging.basicConfig(
     level=logging.DEBUG if settings.debug else logging.INFO,

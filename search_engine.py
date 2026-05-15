@@ -6,8 +6,8 @@ from typing import Optional, List, Dict, Any
 from pinecone import Pinecone, ServerlessSpec
 from fastembed import TextEmbedding
 
-from app.config import settings
-from app.models import AttendeeCreate, AttendeeResult
+from config import settings
+from models import AttendeeCreate, AttendeeResult
 
 logger = logging.getLogger(__name__)
 

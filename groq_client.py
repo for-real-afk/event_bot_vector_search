@@ -3,7 +3,7 @@ import httpx
 import json
 import logging
 from typing import Optional
-from app.config import settings
+from config import settings
 
 
 def _build_auth_header(api_key: str) -> str:
