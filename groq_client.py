@@ -1,8 +1,18 @@
+import base64
 import httpx
 import json
 import logging
 from typing import Optional
 from app.config import settings
+
+
+def _build_auth_header(api_key: str) -> str:
+    # "user:pass" format → Basic auth (nginx-proxied Ollama)
+    # plain token → Bearer auth (Groq / raw Ollama)
+    if ":" in api_key:
+        encoded = base64.b64encode(api_key.encode()).decode()
+        return f"Basic {encoded}"
+    return f"Bearer {api_key}"
 
 logger = logging.getLogger(__name__)
 
@@ -18,57 +28,47 @@ Keywords:"""
 
 # ── Full query parser — extracts semantic query + hard filters ────────────────
 PARSE_PROMPT = """\
-You are a search query parser for an event attendee search system.
-Extract two things from the user query and return ONLY valid JSON, nothing else.
+You are a search assistant for a professional directory of event attendees.
+Given a natural language query, produce a compact keyword-rich search phrase \
+that would retrieve the most relevant professional profiles from a semantic vector database.
 
-1. "semantic_query": the core topic to search — remove experience/seniority words, \
-keep skills, domains, roles. Also expand with 5-8 related synonyms and skills.
+Rules:
+- Strip conversational filler ("people who", "find me", "show me", "I want", "give me").
+- Preserve the full intent of the query — domain, role, industry, activity, specialty.
+- Expand with synonyms, related job titles, and adjacent terms a professional profile \
+  would actually contain. Stay on-topic; do not drift into unrelated fields.
+- 6-10 words total.
 
-2. "filters": a JSON object with optional keys:
-   - "experience_level": one of "junior" | "mid" | "senior" | "expert" — or omit if not mentioned
-     Mapping rules:
-       junior  → fresher, entry level, graduate, 0-2 years, 1 year, 2 years
-       mid     → 3-5 years, intermediate, associate, 3 years, 4 years, 5 years or less
-       senior  → 5-8 years, experienced, 6 years, 7 years, 8 years
-       expert  → 10+ years, principal, staff, lead, veteran, distinguished
-   - "organization": exact org name if mentioned — or omit
+Also extract optional hard filters:
+- "experience_level": "junior" | "mid" | "senior" | "expert" — only if explicitly mentioned
+    junior = 0-2 yrs / fresher; mid = 3-5 yrs; senior = 5-8 yrs; expert = 10+ yrs / lead
+- "organization": exact company name — only if explicitly mentioned
 
-Return ONLY this JSON format, no markdown, no explanation:
+Return ONLY valid JSON, no markdown, no explanation:
 {{"semantic_query": "...", "filters": {{}}}}
 
-Examples:
-Query: "AI engineers with 5 years or less experience"
-{{"semantic_query": "AI engineers machine learning deep learning NLP data science", "filters": {{"experience_level": "mid"}}}}
-
-Query: "senior NLP researchers"
-{{"semantic_query": "NLP researchers natural language processing text mining computational linguistics", "filters": {{"experience_level": "senior"}}}}
-
-Query: "founders working in agriculture"
-{{"semantic_query": "founders entrepreneurs agriculture agritech farming startup food tech", "filters": {{}}}}
-
-Query: "ML engineers at IIT Bombay"
-{{"semantic_query": "machine learning engineers deep learning AI researchers", "filters": {{"organization": "IIT Bombay AI Lab"}}}}
-
-Query: "junior data scientists"
-{{"semantic_query": "data scientists analysts machine learning entry level", "filters": {{"experience_level": "junior"}}}}
+Example:
+Query: "senior data scientists at Google"
+{{"semantic_query": "data scientist machine learning analytics Python statistics", "filters": {{"experience_level": "senior", "organization": "Google"}}}}
 
 Now parse this query:
 Query: "{query}"
 """
 
 
-async def _call_groq(prompt: str, max_tokens: int = 120) -> Optional[str]:
-    """Shared Groq API call."""
+async def _call_groq(prompt: str, max_tokens: int = 150) -> Optional[str]:
+    """Shared LLM API call — supports Groq, OpenAI-compat, and native Ollama."""
     if not settings.groq_api_key:
         return None
+    headers = {
+        "Authorization": _build_auth_header(settings.groq_api_key),
+        "Content-Type": "application/json",
+    }
     try:
-        async with httpx.AsyncClient(timeout=5.0) as client:
+        async with httpx.AsyncClient(timeout=10.0) as client:
             resp = await client.post(
                 f"{settings.groq_base_url}/chat/completions",
-                headers={
-                    "Authorization": f"Bearer {settings.groq_api_key}",
-                    "Content-Type": "application/json",
-                },
+                headers=headers,
                 json={
                     "model": settings.groq_model,
                     "messages": [{"role": "user", "content": prompt}],
@@ -76,10 +76,40 @@ async def _call_groq(prompt: str, max_tokens: int = 120) -> Optional[str]:
                     "temperature": 0.1,
                 },
             )
+            if resp.status_code == 404:
+                # Proxy blocks /v1/chat/completions → fall back to native Ollama /api/chat
+                base = settings.groq_base_url.rstrip("/").removesuffix("/v1")
+                resp = await client.post(
+                    f"{base}/api/chat",
+                    headers=headers,
+                    json={
+                        "model": settings.groq_model,
+                        "messages": [{"role": "user", "content": prompt}],
+                        "stream": False,
+                        "options": {"temperature": 0.1, "num_predict": max_tokens},
+                    },
+                )
+                resp.raise_for_status()
+                # Ollama may return newline-delimited JSON chunks even with stream=false
+                decoder = json.JSONDecoder()
+                text = resp.text.strip()
+                parts, pos = [], 0
+                while pos < len(text):
+                    try:
+                        chunk, end = decoder.raw_decode(text, pos)
+                        token = chunk.get("message", {}).get("content", "")
+                        if token:
+                            parts.append(token)
+                        pos = end
+                        while pos < len(text) and text[pos] in " \t\n\r":
+                            pos += 1
+                    except json.JSONDecodeError:
+                        break
+                return "".join(parts).strip() or None
             resp.raise_for_status()
             return resp.json()["choices"][0]["message"]["content"].strip()
     except Exception as e:
-        logger.warning(f"Groq call failed: {e}")
+        logger.warning(f"LLM call failed: {e}")
         return None
 
 
@@ -109,9 +139,9 @@ async def parse_query(query: str) -> dict:
         return {"semantic_query": query, "filters": {}}
 
     try:
-        # Strip markdown fences if model adds them
         cleaned = raw.replace("```json", "").replace("```", "").strip()
-        parsed = json.loads(cleaned)
+        # raw_decode stops at end of first valid JSON object, ignoring extra text
+        parsed, _ = json.JSONDecoder().raw_decode(cleaned)
 
         semantic = parsed.get("semantic_query", query).strip() or query
         filters = {

@@ -1,3 +1,4 @@
+import re
 import time
 import logging
 from typing import Optional, List, Dict, Any
@@ -11,6 +12,13 @@ from app.models import AttendeeCreate, AttendeeResult
 logger = logging.getLogger(__name__)
 
 
+def _strip_noise(text: str) -> str:
+    """Remove emoji, non-ASCII symbols, and collapse whitespace."""
+    text = text.encode("ascii", "ignore").decode("ascii")
+    text = re.sub(r"[^\w\s.,&@()\-/]", " ", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
 def _build_embed_text(a: AttendeeCreate) -> str:
     parts = [
         a.role,
@@ -18,7 +26,8 @@ def _build_embed_text(a: AttendeeCreate) -> str:
         (a.experience_level.value if a.experience_level else ""),
         a.detailed_profile or "",
     ]
-    return " ".join(p for p in parts if p).strip()
+    raw = " ".join(p for p in parts if p).strip()
+    return _strip_noise(raw)
 
 
 def _clean_metadata(payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -80,19 +89,26 @@ class SearchEngine:
         return [v.tolist() for v in self.embedder.embed(texts)]
 
     def upsert(self, attendee: AttendeeCreate) -> None:
+        text = _build_embed_text(attendee)
+        if not text:
+            return
         metadata = _clean_metadata(
             {**attendee.model_dump(mode="json"), "_original_id": attendee.id}
         )
         self.index.upsert(vectors=[{
             "id": attendee.id,
-            "values": self._embed_one(_build_embed_text(attendee)),
+            "values": self._embed_one(text),
             "metadata": metadata,
         }])
         logger.debug(f"Upserted {attendee.id} — {attendee.full_name}")
 
     def upsert_bulk(self, attendees: List[AttendeeCreate]) -> int:
-        texts = [_build_embed_text(a) for a in attendees]
-        vectors = self._embed_batch(texts)
+        pairs = [(a, _build_embed_text(a)) for a in attendees]
+        pairs = [(a, t) for a, t in pairs if t]   # skip empty profiles
+        if not pairs:
+            return 0
+        attendees_filtered, texts = zip(*pairs)
+        vectors = self._embed_batch(list(texts))
 
         batch_size = 100
         records = [
@@ -103,7 +119,7 @@ class SearchEngine:
                     {**a.model_dump(mode="json"), "_original_id": a.id}
                 ),
             }
-            for a, v in zip(attendees, vectors)
+            for a, v in zip(attendees_filtered, vectors)
         ]
         for i in range(0, len(records), batch_size):
             self.index.upsert(vectors=records[i: i + batch_size])
@@ -146,9 +162,29 @@ class SearchEngine:
                 experience_level=m["metadata"].get("experience_level"),
                 detailed_profile=m["metadata"].get("detailed_profile"),
                 linkedin_url=m["metadata"].get("linkedin_url"),
-                score=round(m["score"], 4),
+                score=round(min(m["score"], 1.0), 4),
             )
             for m in response["matches"]
             if m["score"] >= settings.score_threshold
         ]
         return sorted(results, key=lambda r: r.score, reverse=True)
+
+    def reindex_by_ids(self, ids: List[str]) -> int:
+        """Re-embed specific vectors using their existing Pinecone metadata."""
+        fetch_result = self.index.fetch(ids=ids)
+        vectors = fetch_result.get("vectors", {})
+        batch = []
+        for vid, vdata in vectors.items():
+            meta = vdata.get("metadata", {})
+            # Reconstruct an AttendeeCreate-compatible dict for text building
+            role = meta.get("role", "")
+            org  = meta.get("organization", "")
+            prof = meta.get("detailed_profile", "")
+            text = _strip_noise(" ".join(p for p in [role, org, prof] if p).strip())
+            if not text:
+                continue
+            batch.append({"id": vid, "values": self._embed_one(text), "metadata": meta})
+        if batch:
+            self.index.upsert(vectors=batch)
+        logger.info(f"Reindexed {len(batch)} vectors")
+        return len(batch)

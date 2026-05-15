@@ -37,6 +37,19 @@ class AttendeeResult(BaseModel):
     score: float                            # cosine similarity 0-1 (higher = better match)
 
 
+class AttendeeProfile(BaseModel):
+    """Full profile returned by GET /attendees/{id} — includes contact details."""
+    id: str
+    full_name: str
+    email: Optional[str]
+    phone: Optional[str]
+    organization: str
+    role: str
+    experience_level: Optional[str]
+    detailed_profile: Optional[str]
+    linkedin_url: Optional[str]
+
+
 class SearchResponse(BaseModel):
     query: str
     expanded_query: Optional[str]           # Groq-rewritten query (null if Groq is off)

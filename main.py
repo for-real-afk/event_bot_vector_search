@@ -2,11 +2,11 @@ import logging
 from contextlib import asynccontextmanager
 from typing import Optional, List
 
-from fastapi import FastAPI, Query
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.config import settings
-from app.models import AttendeeCreate, SearchResponse, BulkUpsertResponse
+from app.models import AttendeeCreate, AttendeeProfile, AttendeeResult, SearchResponse, BulkUpsertResponse
 from app.search_engine import SearchEngine
 from app.groq_client import parse_query
 
@@ -38,7 +38,7 @@ app = FastAPI(
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=[o.strip() for o in settings.allowed_origins.split(",")],
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -63,6 +63,41 @@ def add_attendee(attendee: AttendeeCreate):
 def bulk_add(attendees: List[AttendeeCreate]):
     count = engine.upsert_bulk(attendees)
     return BulkUpsertResponse(indexed=count, message=f"{count} attendee(s) indexed")
+
+
+def _normalize_url(url: str | None) -> str | None:
+    """Ensure URL has a scheme so it is a valid clickable link."""
+    if not url:
+        return None
+    url = url.strip()
+    if url and not url.startswith(("http://", "https://")):
+        url = "https://" + url
+    return url
+
+
+@app.get("/attendees/{attendee_id}", response_model=AttendeeProfile, tags=["search"])
+def get_attendee(attendee_id: str):
+    """
+    Fetch full profile for a single attendee by ID.
+    Called when a user clicks a search result to view complete contact details.
+    Reads directly from Pinecone metadata — no separate database needed.
+    """
+    result = engine.index.fetch(ids=[attendee_id])
+    vectors = result.get("vectors", {})
+    if attendee_id not in vectors:
+        raise HTTPException(status_code=404, detail="Attendee not found.")
+    meta = vectors[attendee_id].get("metadata", {})
+    return AttendeeProfile(
+        id=meta.get("_original_id", attendee_id),
+        full_name=meta.get("full_name", ""),
+        email=meta.get("email"),
+        phone=meta.get("phone"),
+        organization=meta.get("organization", ""),
+        role=meta.get("role", ""),
+        experience_level=meta.get("experience_level"),
+        detailed_profile=meta.get("detailed_profile"),
+        linkedin_url=_normalize_url(meta.get("linkedin_url")),
+    )
 
 
 @app.delete("/attendees/{attendee_id}", tags=["indexing"])
